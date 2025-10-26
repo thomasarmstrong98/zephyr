@@ -1,19 +1,49 @@
-from typing import Dict, List, Optional, Tuple
+from dataclasses import dataclass
+from typing import List, Tuple
 
 import torch
-from torch import Tensor, nn
+from torch import nn
 from torch.nn.init import trunc_normal_
 
 from ...data.structures import WeatherBatch
-from ..base import GraphWeatherModel
-from ..graphs import create_grid_graph, grid_to_graph_patch, graph_to_grid_patch
-from .config import Config
-from .core import OutputLayer, TimestepEmbedder
+from ..base import WeatherModel
+from .core import Block, OutputLayer, TimestepEmbedder
 from .embedding import WeatherEmbedding
-from .graph_layers import GraphProcessor
 
 
-class Stormer(nn.Module, GraphWeatherModel):
+@dataclass
+class Config:
+    """Configuration for Stormer weather prediction model."""
+
+    patch_size: int
+    hidden_size: int
+    depth: int
+    num_heads: int
+    mlp_ratio: float
+
+    def build(self, variables: List[str], img_size: Tuple[int, int]) -> "Stormer":
+        """
+        Build a Stormer model from this configuration.
+
+        Args:
+            variables: List of variable names the model will predict
+
+        Returns:
+            Configured Stormer model instance
+        """
+
+        return Stormer(
+            img_size=img_size,
+            variables=variables,
+            patch_size=self.patch_size,
+            hidden_size=self.hidden_size,
+            depth=self.depth,
+            num_heads=self.num_heads,
+            mlp_ratio=self.mlp_ratio,
+        )
+
+
+class Stormer(nn.Module, WeatherModel):
     def __init__(
         self,
         img_size: Tuple[int, int],
@@ -23,24 +53,27 @@ class Stormer(nn.Module, GraphWeatherModel):
         depth: int = 24,
         num_heads: int = 8,
         mlp_ratio: float = 4.0,
-        k_neighbors: int = 8,
     ):
         super().__init__()
 
+        # Store configuration for validation
         self.variables = variables
         self.img_size = img_size
-        self.patch_size = patch_size
-
-        self.graph_data = create_grid_graph(img_size, patch_size, k_neighbors)
-        self.register_buffer("edge_index", self.graph_data.edge_index)
 
         self.embedding = WeatherEmbedding(
             img_size, len(variables), hidden_size, patch_size, num_heads
         )
         self.embedding_norm_layer = nn.LayerNorm(hidden_size)
+
+        # forecast timdelta encoding
         self.t_embedder = TimestepEmbedder(hidden_size)
-        self.processor = GraphProcessor(hidden_size, depth, num_heads, mlp_ratio)
+
+        self.blocks = nn.ModuleList(
+            [Block(hidden_size, num_heads, mlp_ratio=mlp_ratio) for _ in range(depth)]
+        )
+
         self.head = OutputLayer(hidden_size, patch_size, len(variables), img_size)
+
         self.init_weights()
 
     def init_weights(self):
@@ -120,104 +153,50 @@ class Stormer(nn.Module, GraphWeatherModel):
             sample_indices=input_batch.sample_indices,
         )
 
-    def get_input_requirements(self) -> dict:
-        """
-        Get model input requirements for validation.
-
-        Returns:
-            Dictionary containing model requirements
-        """
-        return {
-            "img_size": self.embedding.img_size,
-            "n_variables": self.embedding.n_vars,
-            "patch_size": self.embedding.patch_size,
-            "expected_variables": getattr(self, "variables", None),
-        }
-
     def validate_weather_batch(self, weather_batch: WeatherBatch) -> None:
-        """
-        Validate that WeatherBatch is compatible with this model.
-
-        Args:
-            weather_batch: WeatherBatch to validate
-
-        Raises:
-            ValueError: If batch is incompatible with model requirements
-        """
-        requirements = self.get_input_requirements()
-
-        # Check spatial dimensions
-        actual_spatial = weather_batch.spatial_shape
-        expected_spatial = requirements["img_size"]
-        if actual_spatial != expected_spatial:
+        """Validate WeatherBatch compatibility."""
+        if weather_batch.spatial_shape != self.embedding.img_size:
             raise ValueError(
-                f"Spatial dimension mismatch: model expects {expected_spatial}, "
-                f"got {actual_spatial}"
+                f"Spatial mismatch: expected {self.embedding.img_size}, "
+                f"got {weather_batch.spatial_shape}"
             )
 
-        # Check total variable count (flattened)
-        actual_vars = weather_batch.n_variables
-        expected_vars = requirements["n_variables"]
-        if actual_vars != expected_vars:
+        if weather_batch.n_variables != self.embedding.n_vars:
             raise ValueError(
-                f"Variable count mismatch: model expects {expected_vars} (flattened), "
-                f"got {actual_vars} ({weather_batch.n_surface_variables} surface + "
-                f"{weather_batch.n_atmospheric_variables}x{weather_batch.n_levels} atmospheric)"
+                f"Variable count mismatch: expected {self.embedding.n_vars}, "
+                f"got {weather_batch.n_variables}"
             )
-
-        # Check for empty sequences
-        if weather_batch.sequence_length == 0:
-            raise ValueError("Empty input sequence not supported")
-        if weather_batch.forecast_horizon == 0:
-            raise ValueError("Zero forecast horizon not supported")
-
-    def forward_graph(
-        self, x: Tensor, edge_index: Tensor, batch_info: Optional[Dict] = None
-    ) -> Tensor:
-        """
-        Pure graph forward pass.
-
-        Args:
-            x: (B, N, C)
-            edge_index: (2, E)
-            batch_info: Must contain 'forecast_delta' key
-
-        Returns:
-            (B, N, C_out)
-        """
-        B, N, C = x.shape
-        forecast_delta = batch_info.get("forecast_delta")
-
-        x = x.reshape(B * N, C)
-        forecast_delta_expanded = (
-            forecast_delta.unsqueeze(1).expand(B, N).reshape(B * N, -1).squeeze(-1)
-        )
-        forecast_delta_emb = self.t_embedder(forecast_delta_expanded)
-
-        x = self.processor(x, edge_index, forecast_delta_emb)
-        x = x.reshape(B, N, -1)
-        return x
-
-    def get_edge_index(self) -> Tensor:
-        return self.edge_index
 
     def forward(self, weather_batch: WeatherBatch) -> WeatherBatch:
-        x = weather_batch.flatten_inputs()[:, -1]
-        forecast_timedelta = weather_batch.get_forecast_deltas()[:, 0]
+        """
+        Forward pass using WeatherBatch structured input.
 
+        Args:
+            weather_batch: WeatherBatch containing inputs, targets, and metadata
+
+        Returns:
+            WeatherBatch with predicted outputs replacing targets
+        """
+        # Extract input a - take last timestep for single-step prediction
+        x = weather_batch.flatten_inputs()[:, -1]  # Shape: (B, V, H, W)
+
+        # Get forecast timedeltas - take first forecast timestep
+        forecast_timedelta = weather_batch.get_forecast_deltas()[:, 0]  # Shape: (B,)
+
+        # Forward pass through model
+        print(f"pre-embedding: {x.shape}")
         x = self.embedding(x)
         x = self.embedding_norm_layer(x)
+        print(f"post-embedding: {x.shape}")
 
-        x_graph, num_nodes = grid_to_graph_patch(x.permute(0, 2, 3, 1), self.graph_data, self.patch_size)
-        x_graph = self.forward_graph(
-            x_graph, self.edge_index, {"forecast_delta": forecast_timedelta}
-        )
+        forecast_timedelta = self.t_embedder(forecast_timedelta)
+        print(f"tdelta: {forecast_timedelta.shape}")
+        for block in self.blocks:
+            print(f"pre-block: {x.shape}")
+            x = block(x, forecast_timedelta)
+            print(f"post-block: {x.shape}")
 
-        x_out = graph_to_grid_patch(x_graph, self.graph_data, self.img_size, self.patch_size)
-        x_out = x_out.permute(0, 3, 1, 2)
+        predictions = self.head(x)  # Shape: (B, V, H, W)
 
-        predictions = self.head(
-            x_out.permute(0, 2, 3, 1).reshape(x_out.shape[0], -1, x_out.shape[1])
-        )
-
+        # Create output WeatherBatch with predictions
         return self._create_prediction_batch(weather_batch, predictions)

@@ -216,7 +216,7 @@ class WeatherBatch:
     def get_forecast_deltas(self) -> torch.Tensor:
         batch_deltas = []
         for i in range(self.batch_size):
-            if not self.input_timestamps[i] or not self.target_timestamps[i]:
+            if len(self.input_timestamps[i]) == 0 or len(self.target_timestamps[i]) == 0:
                 deltas = torch.zeros(self.forecast_horizon)
             else:
                 last_input = self.input_timestamps[i][-1]

@@ -164,10 +164,10 @@ class WeatherBenchDataset(Dataset):
                 )
             if atmospheric_inputs is not None:
                 atmospheric_inputs = self.normalizer.normalize_atmospheric(
-                    atmospheric_inputs, self.pressure_level_vars
+                    atmospheric_inputs, self.pressure_level_vars, self.pressure_levels
                 )
                 atmospheric_targets = self.normalizer.normalize_atmospheric(
-                    atmospheric_targets, self.pressure_level_vars
+                    atmospheric_targets, self.pressure_level_vars, self.pressure_levels
                 )
 
         return WeatherSample(
@@ -189,17 +189,21 @@ class WeatherBenchDataset(Dataset):
     def _extract_variables(
         self, ds: xr.Dataset
     ) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
-        surface_arrays = [ds[v].values for v in self.surface_vars]
-        atmospheric_arrays = [ds[v].values for v in self.pressure_level_vars]
+        def extract_surface(var: str) -> np.ndarray:
+            da = ds[var].transpose(*[d for d in ["time", "latitude", "longitude"] if d in ds[var].dims])
+            data = da.values
+            if "time" not in ds[var].dims:
+                data = np.broadcast_to(data[np.newaxis, :, :], (ds.sizes["time"],) + data.shape)
+            return data
 
-        surface_tensor = (
-            torch.from_numpy(np.stack(surface_arrays, axis=1)).float() if surface_arrays else None
-        )
-        atmospheric_tensor = (
-            torch.from_numpy(np.stack(atmospheric_arrays, axis=1)).float()
-            if atmospheric_arrays
-            else None
-        )
+        def extract_atmospheric(var: str) -> np.ndarray:
+            return ds[var].transpose("time", "level", "latitude", "longitude").values
+
+        surface_arrays = [extract_surface(v) for v in self.surface_vars] if self.surface_vars else []
+        atmospheric_arrays = [extract_atmospheric(v) for v in self.pressure_level_vars] if self.pressure_level_vars else []
+
+        surface_tensor = torch.from_numpy(np.stack(surface_arrays, axis=1)).float() if surface_arrays else None
+        atmospheric_tensor = torch.from_numpy(np.stack(atmospheric_arrays, axis=1)).float() if atmospheric_arrays else None
 
         return surface_tensor, atmospheric_tensor
 
@@ -223,14 +227,18 @@ class WeatherBenchDataset(Dataset):
         )
         ai = (
             self.normalizer.unnormalize_atmospheric(
-                sample.atmospheric_inputs, sample.atmospheric_variable_names
+                sample.atmospheric_inputs,
+                sample.atmospheric_variable_names,
+                sample.pressure_levels,
             )
             if sample.atmospheric_inputs is not None
             else None
         )
         at = (
             self.normalizer.unnormalize_atmospheric(
-                sample.atmospheric_targets, sample.atmospheric_variable_names
+                sample.atmospheric_targets,
+                sample.atmospheric_variable_names,
+                sample.pressure_levels,
             )
             if sample.atmospheric_targets is not None
             else None

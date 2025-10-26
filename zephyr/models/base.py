@@ -28,14 +28,21 @@ class GraphWeatherModel(WeatherModel):
     """Extended interface for graph-based weather models."""
 
     @abstractmethod
-    def forward_graph(self, x: Tensor, edge_index: Tensor, batch_info: Optional[Dict] = None) -> Tensor:
+    def forward_graph(
+        self,
+        x: Tensor,
+        edge_index: Tensor,
+        edge_attr: Optional[Tensor] = None,
+        batch_info: Optional[Dict] = None
+    ) -> Tensor:
         """
         Forward pass using graph representation.
 
         Args:
             x: Node features (B*N, C) or (B, N, C)
             edge_index: Edge connectivity (2, E)
-            batch_info: Optional metadata (forecast_delta, node_count, etc.)
+            edge_attr: Optional edge features (E, D_edge). Used by GraphCast.
+            batch_info: Optional metadata (forecast_delta, node_count, etc.). Used by Stormer.
 
         Returns:
             Node predictions (B*N, C) or (B, N, C)

@@ -88,7 +88,7 @@ class MLP(nn.Module):
 
 class Block(nn.Module):
     """
-    An transformers block with adaptive layer norm zero (adaLN-Zero) conditioning.
+    A transformer block with adaptive layer norm zero (adaLN-Zero) conditioning.
     """
 
     def __init__(self, hidden_size, num_heads, mlp_ratio=4.0, **block_kwargs):
@@ -102,9 +102,11 @@ class Block(nn.Module):
         )
 
     def forward(self, x, c):
-        shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = self.adaLN_modulation(
-            c
-        ).chunk(6, dim=-1)
+        shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = (
+            self.adaLN_modulation(c).unsqueeze(-2).chunk(6, dim=-1)
+        )
+        print(shift_msa.shape, x.shape)
+        print(scale_msa.shape, x.shape)
         x = x + gate_msa * self.attn(modulate(self.norm1(x), shift_msa, scale_msa))
         x = x + gate_mlp * self.mlp(modulate(self.norm2(x), shift_mlp, scale_mlp))
         return x

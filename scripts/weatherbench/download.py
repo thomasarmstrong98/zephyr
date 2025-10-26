@@ -12,10 +12,10 @@ import xarray as xr
 import zarr
 from tqdm.dask import TqdmCallback
 
-import zephyr
 from zephyr.data.variables import (
+    ATMOSPHERIC_LEVELS,
     ATMOSPHERIC_VARIABLE_NAMES,
-    ATOMOSPHERIC_LEVELS,
+    DEFAULT_ZARR_PATH,
     FORCED_VARIABLES,
     SURFACE_VARIABLES,
 )
@@ -24,7 +24,6 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 GCP_PATH = "gs://weatherbench2/datasets/era5/1959-2023_01_10-6h-240x121_equiangular_with_poles_conservative.zarr"
-DEFAULT_OUTPUT_PATH = Path(zephyr.__file__).parents[1] / "data" / "weatherbench.zarr"
 
 
 def open_weatherbench_dataset() -> xr.Dataset:
@@ -91,7 +90,7 @@ def parse_args():
 
     parser.add_argument(
         "--output",
-        default=DEFAULT_OUTPUT_PATH,
+        default=DEFAULT_ZARR_PATH,
         help="Local output path",
     )
     parser.add_argument("--years", default="2000,2020", help="Year range as start,end")
@@ -114,7 +113,7 @@ def main():
             dataset=dataset,
             variables=SURFACE_VARIABLES + ATMOSPHERIC_VARIABLE_NAMES + FORCED_VARIABLES,
             years=years,
-            pressure_levels=ATOMOSPHERIC_LEVELS,
+            pressure_levels=ATMOSPHERIC_LEVELS,
             output_path=Path(args.output),
         )
         logger.info("Download completed successfully!")

@@ -1,8 +1,8 @@
 """
 Icosahedral mesh graph construction for GraphCast-style weather models.
 
-This module implements icosahedral mesh generation and grid-graph interpolation
-based on the GraphCast architecture (Lam et al., Science 2023).
+This module implements icosahedral mesh generation and bipartite graph construction
+for grid-mesh connectivity, based on the GraphCast architecture (Lam et al., Science 2023).
 
 Reference:
     GraphCast: Learning skillful medium-range global weather forecasting
@@ -14,8 +14,9 @@ from typing import Tuple
 
 import icosphere
 import numpy as np
+import scipy.spatial
 import torch
-from torch import Tensor
+import trimesh
 
 from .base import GraphData
 
@@ -41,139 +42,176 @@ def _build_edges(faces: np.ndarray, n_vertices: int) -> np.ndarray:
     return bidirectional.T
 
 
-def _compute_interpolation_weights(
-    source_coords: np.ndarray,
-    target_coords: np.ndarray,
-    k: int = 4
-) -> Tuple[np.ndarray, np.ndarray]:
+def _grid_lat_lon_to_xyz(grid_latitude: np.ndarray, grid_longitude: np.ndarray) -> np.ndarray:
     """
-    Compute k-NN interpolation weights using inverse distance weighting.
+    Convert lat-lon grid to 3D Cartesian coordinates on unit sphere.
 
     Args:
-        source_coords: Source coordinate array (N_source, 2)
-        target_coords: Target coordinate array (N_target, 2)
-        k: Number of nearest neighbors
+        grid_latitude: 1D array of latitudes in degrees
+        grid_longitude: 1D array of longitudes in degrees
 
     Returns:
-        indices: Neighbor indices (N_target, k)
-        weights: Interpolation weights (N_target, k)
+        Array of shape (H, W, 3) with Cartesian coordinates
     """
-    from scipy.spatial import cKDTree
+    # Create meshgrid: phi (longitude), theta (colatitude)
+    phi_grid, theta_grid = np.meshgrid(
+        np.deg2rad(grid_longitude),
+        np.deg2rad(90 - grid_latitude)
+    )
 
-    tree = cKDTree(source_coords)
-    distances, indices = tree.query(target_coords, k=k)
+    # Convert to Cartesian coordinates
+    x = np.cos(phi_grid) * np.sin(theta_grid)
+    y = np.sin(phi_grid) * np.sin(theta_grid)
+    z = np.cos(theta_grid)
 
-    eps = 1e-10
-    inv_distances = 1.0 / (distances + eps)
-    weights = inv_distances / inv_distances.sum(axis=1, keepdims=True)
-
-    return indices, weights
+    return np.stack([x, y, z], axis=-1)
 
 
-def create_icosahedral_graph(levels: int, grid_shape: Tuple[int, int]) -> GraphData:
+def radius_query_indices(
+    grid_latitude: np.ndarray,
+    grid_longitude: np.ndarray,
+    mesh_vertices: np.ndarray,
+    radius: float
+) -> Tuple[np.ndarray, np.ndarray]:
     """
-    Create an icosahedral mesh graph with grid interpolation weights.
+    Find mesh vertices within a radius of each grid point (for Grid2Mesh).
+
+    Args:
+        grid_latitude: 1D array of latitudes in degrees (H,)
+        grid_longitude: 1D array of longitudes in degrees (W,)
+        mesh_vertices: Mesh vertex positions in 3D (N, 3)
+        radius: Query radius for neighbor search
+
+    Returns:
+        grid_indices: Grid point indices (E,)
+        mesh_indices: Corresponding mesh vertex indices (E,)
+    """
+    # Convert grid to 3D coordinates
+    grid_positions = _grid_lat_lon_to_xyz(grid_latitude, grid_longitude)
+    H, W = grid_positions.shape[:2]
+    grid_positions_flat = grid_positions.reshape(-1, 3)
+
+    # Build KD-tree for mesh vertices
+    kd_tree = scipy.spatial.cKDTree(mesh_vertices)
+
+    # Query for all mesh vertices within radius of each grid point
+    query_indices = kd_tree.query_ball_point(x=grid_positions_flat, r=radius)
+
+    # Flatten results into edge list
+    grid_edge_indices = []
+    mesh_edge_indices = []
+
+    for grid_idx, mesh_neighbors in enumerate(query_indices):
+        if len(mesh_neighbors) > 0:
+            grid_edge_indices.append(np.repeat(grid_idx, len(mesh_neighbors)))
+            mesh_edge_indices.append(mesh_neighbors)
+
+    grid_edge_indices = np.concatenate(grid_edge_indices, axis=0).astype(np.int64)
+    mesh_edge_indices = np.concatenate(mesh_edge_indices, axis=0).astype(np.int64)
+
+    return grid_edge_indices, mesh_edge_indices
+
+
+def in_mesh_triangle_indices(
+    grid_latitude: np.ndarray,
+    grid_longitude: np.ndarray,
+    mesh_vertices: np.ndarray,
+    mesh_faces: np.ndarray
+) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    Find containing triangle vertices for each grid point (for Mesh2Grid).
+
+    Each grid point is connected to the 3 vertices of its containing triangle.
+
+    Args:
+        grid_latitude: 1D array of latitudes in degrees (H,)
+        grid_longitude: 1D array of longitudes in degrees (W,)
+        mesh_vertices: Mesh vertex positions in 3D (N, 3)
+        mesh_faces: Mesh triangle faces (F, 3)
+
+    Returns:
+        grid_indices: Grid point indices, repeated 3x per point (H*W*3,)
+        mesh_indices: Triangle vertex indices (H*W*3,)
+    """
+    # Convert grid to 3D coordinates
+    grid_positions = _grid_lat_lon_to_xyz(grid_latitude, grid_longitude)
+    H, W = grid_positions.shape[:2]
+    grid_positions_flat = grid_positions.reshape(-1, 3)
+
+    # Create trimesh object
+    mesh = trimesh.Trimesh(vertices=mesh_vertices, faces=mesh_faces)
+
+    # Find closest point and containing triangle for each grid point
+    closest_points, distances, triangle_ids = mesh.nearest.on_surface(grid_positions_flat)
+
+    # Get the 3 vertices of each containing triangle
+    containing_triangles = mesh_faces[triangle_ids]  # (H*W, 3)
+
+    # Create edge list: each grid point connects to 3 triangle vertices
+    grid_indices = np.repeat(np.arange(H * W), 3)
+    mesh_indices = containing_triangles.flatten()
+
+    return grid_indices.astype(np.int64), mesh_indices.astype(np.int64)
+
+
+def create_icosahedral_graph(
+    levels: int,
+    grid_shape: Tuple[int, int],
+    radius: float = 0.6
+) -> GraphData:
+    """
+    Create an icosahedral mesh graph with bipartite grid-mesh connectivity.
 
     This function generates a multi-resolution icosahedral mesh similar to GraphCast
-    and computes bidirectional interpolation weights between the mesh nodes and
-    a regular lat-lon grid.
+    and computes bipartite graph connections between the mesh nodes and a regular
+    lat-lon grid using radius queries and triangle containment.
 
     Args:
         levels: Number of refinement levels for the icosahedron
         grid_shape: Shape of the lat-lon grid (H, W)
+        radius: Query radius for grid2mesh connections (default: 0.6)
 
     Returns:
-        GraphData containing the mesh structure and interpolation weights
+        GraphData containing the mesh structure and bipartite connectivity
     """
     # Generate icosahedral mesh
     vertices, faces = icosphere.icosphere(nu=levels)
-    node_lat_lon = _xyz_to_latlon(vertices)
     edge_index = _build_edges(faces, len(vertices))
 
     # Create regular lat-lon grid
     H, W = grid_shape
-    lats = np.linspace(90, -90, H)
-    lons = np.linspace(-180, 180, W, endpoint=False)
-    grid_lons, grid_lats = np.meshgrid(lons, lats)
-    grid_coords = np.stack([grid_lats.flatten(), grid_lons.flatten()], axis=1)
+    grid_lat = np.linspace(90, -90, H)
+    grid_lon = np.linspace(-180, 180, W, endpoint=False)
 
-    # Compute interpolation weights: nodes -> grid
-    node_to_grid_idx, node_to_grid_weights = _compute_interpolation_weights(
-        grid_coords, node_lat_lon, k=4
+    # Compute maximum edge length for radius scaling
+    edge_lengths = np.linalg.norm(
+        vertices[edge_index[0]] - vertices[edge_index[1]], axis=1
+    )
+    max_edge_length = edge_lengths.max()
+    query_radius = radius * max_edge_length
+
+    # Grid2Mesh: radius query to find mesh nodes near each grid point
+    grid_indices_g2m, mesh_indices_g2m = radius_query_indices(
+        grid_lat, grid_lon, vertices, query_radius
     )
 
-    # Compute interpolation weights: grid -> nodes
-    grid_to_node_idx, grid_to_node_weights = _compute_interpolation_weights(
-        node_lat_lon, grid_coords, k=4
+    # Mesh2Grid: triangle containment for exact interpolation
+    grid_indices_m2g, mesh_indices_m2g = in_mesh_triangle_indices(
+        grid_lat, grid_lon, vertices, faces
     )
-    grid_to_node_idx = grid_to_node_idx.reshape(H, W, -1)
-    grid_to_node_weights = grid_to_node_weights.reshape(H, W, -1)
+
+    # Create edge indices in PyG format (2, E)
+    grid2mesh_edges = np.stack([grid_indices_g2m, mesh_indices_g2m], axis=0)
+    mesh2grid_edges = np.stack([mesh_indices_m2g, grid_indices_m2g], axis=0)
 
     return GraphData(
-        node_coords=torch.from_numpy(node_lat_lon).float(),
+        node_coords=torch.from_numpy(vertices).float(),
         edge_index=torch.from_numpy(edge_index).long(),
         num_nodes=len(vertices),
-        grid_to_node_idx=torch.from_numpy(grid_to_node_idx).long(),
-        grid_to_node_weights=torch.from_numpy(grid_to_node_weights).float(),
-        node_to_grid_idx=torch.from_numpy(node_to_grid_idx).long(),
-        node_to_grid_weights=torch.from_numpy(node_to_grid_weights).float()
+        faces=torch.from_numpy(faces).long(),
+        grid_lat=torch.from_numpy(grid_lat).float(),
+        grid_lon=torch.from_numpy(grid_lon).float(),
+        num_grid_nodes=H * W,
+        grid2mesh_edge_index=torch.from_numpy(grid2mesh_edges).long(),
+        mesh2grid_edge_index=torch.from_numpy(mesh2grid_edges).long()
     )
-
-
-def grid_to_graph_ico(x_grid: Tensor, graph_data: GraphData) -> Tuple[Tensor, int]:
-    """
-    Convert grid representation to graph representation using interpolation.
-
-    Args:
-        x_grid: Grid tensor of shape (B, C, H, W)
-        graph_data: Graph structure with interpolation weights
-
-    Returns:
-        x_graph: Graph tensor of shape (B, N, C)
-        num_nodes: Number of nodes N
-    """
-    B, C, H, W = x_grid.shape
-    k = graph_data.grid_to_node_idx.shape[-1]
-
-    x_grid = x_grid.permute(0, 2, 3, 1)  # (B, H, W, C)
-    indices = graph_data.grid_to_node_idx.to(x_grid.device)
-    weights = graph_data.grid_to_node_weights.to(x_grid.device)
-
-    x_flat = x_grid.reshape(B, H * W, C)
-    indices_flat = indices.reshape(H * W, k)
-
-    x_neighbors = x_flat[:, indices_flat]  # (B, H*W, k, C)
-    weights_expanded = weights.reshape(H * W, k, 1)
-
-    x_nodes = (x_neighbors * weights_expanded).sum(dim=2)  # (B, H*W, C)
-    return x_nodes, graph_data.num_nodes
-
-
-def graph_to_grid_ico(x_nodes: Tensor, graph_data: GraphData, grid_shape: Tuple[int, int]) -> Tensor:
-    """
-    Convert graph representation to grid representation using interpolation.
-
-    Args:
-        x_nodes: Graph tensor of shape (B, N, C)
-        graph_data: Graph structure with interpolation weights
-        grid_shape: Target grid shape (H, W)
-
-    Returns:
-        x_grid: Grid tensor of shape (B, C, H, W)
-    """
-    B, N, C = x_nodes.shape
-    H, W = grid_shape
-    k = graph_data.node_to_grid_idx.shape[-1]
-
-    indices = graph_data.node_to_grid_idx.to(x_nodes.device)
-    weights = graph_data.node_to_grid_weights.to(x_nodes.device)
-
-    x_grid_flat = torch.zeros(B, H * W, C, device=x_nodes.device)
-
-    for b in range(B):
-        for i in range(k):
-            grid_idx = indices[:, i]
-            w = weights[:, i:i+1]
-            x_grid_flat[b].scatter_add_(0, grid_idx.unsqueeze(1).expand(-1, C), x_nodes[b] * w)
-
-    return x_grid_flat.reshape(B, H, W, C).permute(0, 3, 1, 2)

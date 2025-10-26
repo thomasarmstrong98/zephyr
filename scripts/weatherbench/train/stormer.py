@@ -41,11 +41,7 @@ def main(cfg: DictConfig) -> None:
         normalize=data_cfg.normalize,
     )
 
-    model = zephyr.Stormer(
-        img_size=tuple(model_cfg.img_size), variables=VARIABLES_CATALOG,
-        patch_size=model_cfg.patch_size, hidden_size=model_cfg.hidden_size,
-        depth=model_cfg.depth, num_heads=model_cfg.num_heads, mlp_ratio=model_cfg.mlp_ratio,
-    )
+    model = model_cfg.build(variables=VARIABLES_CATALOG)
 
     total_params = sum(p.numel() for p in model.parameters())
     trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
